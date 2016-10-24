@@ -5,6 +5,7 @@ import re
 import botocore
 from pykube.objects import Pod
 
+import autoscaler.aws_utils as aws_utils
 import autoscaler.capacity as capacity
 import autoscaler.utils as utils
 
@@ -43,41 +44,17 @@ class AutoScalingGroups(object):
         # ASGs to avoid because of spot pricing history
         self._spot_timeouts = {}
 
-    def get_client_groups(self, client, next_token=None):
-        if next_token == '':
-            return []
-
-        kwargs = {}
-        if next_token is not None:
-            kwargs['NextToken'] = next_token
-
-        groups_data = client.describe_auto_scaling_groups(**kwargs)
-        next_groups = self.get_client_groups(
-            client, next_token=groups_data.get('NextToken', ''))
-        return groups_data['AutoScalingGroups'] + next_groups
-
-    def get_client_launch_configs(self, client, names, next_token=None):
-        if next_token == '':
-            return []
-
-        kwargs = {
-            'LaunchConfigurationNames': names
-        }
-        if next_token is not None:
-            kwargs['NextToken'] = next_token
-
-        configs_data = client.describe_launch_configurations(**kwargs)
-        next_configs = self.get_client_launch_configs(
-            client, names, next_token=configs_data.get('NextToken', ''))
-        return configs_data['LaunchConfigurations'] + next_configs
-
     def get_all_launch_configs(self, client, raw_groups):
         all_launch_configs = {}
         batch_size = 50
         for launch_config_idx in range(0, len(raw_groups), batch_size):
             groups = raw_groups[launch_config_idx*batch_size:(launch_config_idx+1)*batch_size]
-            launch_configs = self.get_client_launch_configs(
-                client, [g['LaunchConfigurationName'] for g in groups])
+            kwargs = {
+                'LaunchConfigurationNames': [g['LaunchConfigurationName'] for g in groups]
+            }
+            launch_configs = aws_utils.fetch_all(
+                client.describe_launch_configurations,
+                kwargs, 'LaunchConfigurations')
             all_launch_configs.update((lc['LaunchConfigurationName'], lc)
                                       for lc in launch_configs)
         return all_launch_configs
@@ -87,7 +64,8 @@ class AutoScalingGroups(object):
         for region in self.regions:
             client = self.session.client(self._BOTO_CLIENT_TYPE,
                                          region_name=region)
-            raw_groups = self.get_client_groups(client)
+            raw_groups = aws_utils.fetch_all(
+                client.describe_auto_scaling_groups, {}, 'AutoScalingGroups')
 
             launch_configs = self.get_all_launch_configs(client, raw_groups)
 
@@ -275,7 +253,13 @@ class AutoScalingGroups(object):
 
         for region, instance_asg_map in region_instance_asg_map.items():
             client = self.session.client('ec2', region_name=region)
-            history = self.get_spot_pricing_history(client, instance_asg_map.keys(), since)
+            kwargs = {
+                'StartTime': since,
+                'InstanceTypes': instance_asg_map.keys(),
+                'ProductDescriptions': ['Linux/UNIX']
+            }
+            history = aws_utils.fetch_all(
+                client.describe_spot_price_history, kwargs, 'SpotPriceHistory')
             for instance_type, asgs in instance_asg_map.items():
                 for asg in asgs:
                     last_az_bid = {}
