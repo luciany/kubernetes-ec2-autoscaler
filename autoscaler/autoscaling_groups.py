@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 class AutoScalingGroups(object):
     _BOTO_CLIENT_TYPE = 'autoscaling'
-    _TIMEOUT = 3600
+    _TIMEOUT = 3600  # 1 hour
+    _SPOT_REQUEST_TIMEOUT = 300  # 5 minutes
+    _MAX_OUTBIDS_IN_INTERVAL = 0.2
+    _SPOT_HISTORY_PERIOD = 60*60*5  # 5 hours
 
     _CLUSTER_KEY = 'KubernetesCluster'
     _ROLE_KEYS = ('KubernetesRole', 'Role')
@@ -36,6 +39,9 @@ class AutoScalingGroups(object):
         # try to favor other regions
         self._timeouts = {}
         self._last_activities = {}
+
+        # ASGs to avoid because of spot pricing history
+        self._spot_timeouts = {}
 
     def get_client_groups(self, client, next_token=None):
         if next_token == '':
@@ -65,6 +71,17 @@ class AutoScalingGroups(object):
             client, names, next_token=configs_data.get('NextToken', ''))
         return configs_data['LaunchConfigurations'] + next_configs
 
+    def get_all_launch_configs(self, client, raw_groups):
+        all_launch_configs = {}
+        batch_size = 50
+        for launch_config_idx in range(0, len(raw_groups), batch_size):
+            groups = raw_groups[launch_config_idx*batch_size:(launch_config_idx+1)*batch_size]
+            launch_configs = self.get_client_launch_configs(
+                client, [g['LaunchConfigurationName'] for g in groups])
+            all_launch_configs.update((lc['LaunchConfigurationName'], lc)
+                                      for lc in launch_configs)
+        return all_launch_configs
+
     def get_all_groups(self, kube_nodes):
         groups = []
         for region in self.regions:
@@ -72,10 +89,7 @@ class AutoScalingGroups(object):
                                          region_name=region)
             raw_groups = self.get_client_groups(client)
 
-            launch_configs = self.get_client_launch_configs(
-                client, [g['LaunchConfigurationName'] for g in raw_groups])
-            launch_configs = dict((lc['LaunchConfigurationName'], lc)
-                                  for lc in launch_configs)
+            launch_configs = self.get_all_launch_configs(client, raw_groups)
 
             for raw_group in sorted(raw_groups, key=lambda g: g['AutoScalingGroupName']):
                 if self.cluster_name:
@@ -95,7 +109,7 @@ class AutoScalingGroups(object):
 
         return groups
 
-    def reconcile_limits(self, asg):
+    def reconcile_limits(self, asg, dry_run=False):
         """
         makes sure the ASG has valid capacity by processing errors
         in its recent scaling activities.
@@ -103,11 +117,11 @@ class AutoScalingGroups(object):
         failure.
         """
         start_time_cutoff = None
-        for i, entry in enumerate(asg.iter_activities()):
+        for entry in asg.iter_activities():
             if entry['ActivityId'] == self._last_activities.get(asg._id):
                 # already processed the rest
                 return
-            if i == 0:
+            if start_time_cutoff is None:
                 # won't process this activity twice
                 self._last_activities[asg._id] = entry['ActivityId']
                 start_time_cutoff = (
@@ -117,10 +131,15 @@ class AutoScalingGroups(object):
                 # skip events that are too old to cut down the time
                 # it takes the first time to go through events
                 break
+
+            # events that have partial progress are not considered processed
+            if entry['Progress'] < 100:
+                start_time_cutoff = None
+
+            status_msg = entry.get('StatusMessage', '')
             if entry['StatusCode'] in ('Failed', 'Cancelled'):
                 logger.warn('%s scaling failure: %s', asg, entry)
 
-                status_msg = entry.get('StatusMessage', '')
                 m = AutoScalingErrorMessages.INSTANCE_LIMIT.match(status_msg)
                 if m:
                     max_desired_capacity = int(m.group('requested')) - 1
@@ -131,7 +150,10 @@ class AutoScalingGroups(object):
 
                         # we tried to go over capacity and failed
                         # now set the desired capacity back to a normal range
-                        asg.set_desired_capacity(max_desired_capacity)
+                        if not dry_run:
+                            asg.set_desired_capacity(max_desired_capacity)
+                        else:
+                            logger.info('[Dry run] Would have set desired capacity to %s', max_desired_capacity)
                     return
 
                 m = AutoScalingErrorMessages.VOLUME_LIMIT.match(status_msg)
@@ -155,19 +177,135 @@ class AutoScalingGroups(object):
 
                             # we tried to go over capacity and failed
                             # now set the desired capacity back to a normal range
-                            asg.set_desired_capacity(original_capacity)
+                            if not dry_run:
+                                asg.set_desired_capacity(original_capacity)
+                            else:
+                                logger.info('[Dry run] Would have set desired capacity to %s', original_capacity)
                     return
+
+                m = AutoScalingErrorMessages.SPOT_REQUEST_CANCELLED.search(status_msg)
+                if m:
+                    # we cancelled a spot request
+                    # don't carry on to reset timeout
+                    continue
+            elif entry['StatusCode'] == 'WaitingForSpotInstanceId':
+                logger.warn('%s waiting for spot: %s', asg, entry)
+                now = datetime.datetime.now(entry['StartTime'].tzinfo)
+                if (now - entry['StartTime']) > datetime.timedelta(seconds=self._SPOT_REQUEST_TIMEOUT):
+                    self._timeouts[asg._id] = entry['StartTime'] + datetime.timedelta(seconds=self._TIMEOUT)
+                    logger.info('%s is timed out until %s',
+                                asg.name, self._timeouts[asg._id])
+
+                    # try to cancel spot request and scale down ASG
+                    spot_request_m = AutoScalingErrorMessages.SPOT_REQUEST_WAITING.search(status_msg)
+                    if spot_request_m:
+                        spot_request_id = spot_request_m.group('request_id')
+                        if not dry_run:
+                            cancelled = self.cancel_spot_request(asg.region, spot_request_id)
+                            if cancelled:
+                                asg.set_desired_capacity(asg.desired_capacity - 1)
+                        else:
+                            logger.info('[Dry run] Would have cancelled spot request %s and decremented desired capacity.',
+                                        spot_request_id)
+                    # don't return here so that we can cancel more spot requests
 
         self._timeouts[asg._id] = None
         logger.debug('%s has no timeout', asg.name)
 
     def is_timed_out(self, asg):
         timeout = self._timeouts.get(asg._id)
+        spot_timeout = self._spot_timeouts.get(asg._id)
 
-        if not timeout:
+        if timeout and datetime.datetime.now(timeout.tzinfo) < timeout:
+            return True
+
+        if spot_timeout and datetime.datetime.utcnow() < spot_timeout:
+            return True
+
+        return False
+
+    def cancel_spot_request(self, region, request_id):
+        client = self.session.client('ec2',
+                                     region_name=region)
+        response = client.describe_spot_instance_requests(
+            SpotInstanceRequestIds=[request_id]
+        )
+        if len(response['SpotInstanceRequests']) == 0:
             return False
 
-        return datetime.datetime.now(timeout.tzinfo) < timeout
+        spot_instance_req = response['SpotInstanceRequests'][0]
+        if spot_instance_req['State'] in ('open', 'active'):
+            response = client.cancel_spot_instance_requests(
+                SpotInstanceRequestIds=[request_id]
+            )
+            return True
+
+        return False
+
+    def get_spot_pricing_history(self, client, instance_types, since, next_token=None):
+        if next_token == '':
+            return []
+
+        kwargs = {
+            'StartTime': since,
+            'InstanceTypes': instance_types,
+            'ProductDescriptions': ['Linux/UNIX']
+        }
+        if next_token is not None:
+            kwargs['NextToken'] = next_token
+
+        history_data = client.describe_spot_price_history(**kwargs)
+        next_items = self.get_spot_pricing_history(
+            client, instance_types, since,
+            next_token=history_data.get('NextToken', ''))
+
+        return history_data['SpotPriceHistory'] + next_items
+
+    def time_out_spot_asgs(self, asgs):
+        region_instance_asg_map = {}
+        for asg in asgs:
+            if not asg.is_spot:
+                continue
+
+            instance_asg_map = region_instance_asg_map.setdefault(asg.region, {})
+            instance_type = asg.launch_config['InstanceType']
+            instance_asg_map.setdefault(instance_type, []).append(asg)
+
+        since = datetime.datetime.utcnow() - datetime.timedelta(seconds=self._SPOT_HISTORY_PERIOD)
+
+        for region, instance_asg_map in region_instance_asg_map.items():
+            client = self.session.client('ec2', region_name=region)
+            history = self.get_spot_pricing_history(client, instance_asg_map.keys(), since)
+            for instance_type, asgs in instance_asg_map.items():
+                for asg in asgs:
+                    last_az_bid = {}
+                    outbid_time = {}
+                    bid_price = float(asg.launch_config['SpotPrice'])
+                    for item in history:
+                        if item['InstanceType'] != instance_type:
+                            continue
+
+                        if float(item['SpotPrice']) > bid_price:
+                            # we would've been outbid!
+                            if item['AvailabilityZone'] in last_az_bid:
+                                time_diff = (last_az_bid[item['AvailabilityZone']] - item['Timestamp'])
+                            else:
+                                time_diff = datetime.timedelta(seconds=0)
+                            outbid_time[item['AvailabilityZone']] = (
+                                outbid_time.get(item['AvailabilityZone'], datetime.timedelta(seconds=0)) +
+                                time_diff)
+                        last_az_bid[item['AvailabilityZone']] = item['Timestamp']
+
+                    if outbid_time:
+                        avg_outbid_time = sum(t.total_seconds() for t in outbid_time.values()) / len(outbid_time)
+                    else:
+                        avg_outbid_time = 0.0
+                    if (avg_outbid_time / self._SPOT_HISTORY_PERIOD) > self._MAX_OUTBIDS_IN_INTERVAL:
+                        self._spot_timeouts[asg._id] = since + datetime.timedelta(seconds=self._TIMEOUT)
+                        logger.info('%s (%s) is spot timed out until %s (would have been outbid for %ss on average)',
+                                    asg.name, asg.region, self._spot_timeouts[asg._id], avg_outbid_time)
+                    else:
+                        self._spot_timeouts[asg._id] = None
 
 
 class AutoScalingGroup(object):
@@ -187,6 +325,9 @@ class AutoScalingGroup(object):
         self.desired_capacity = raw_group['DesiredCapacity']
         self.min_size = raw_group['MinSize']
         self.max_size = raw_group['MaxSize']
+
+        self.is_spot = launch_config.get('SpotPrice') is not None
+
         self.instance_ids = set(inst['InstanceId'] for inst in raw_group['Instances']
                                 if inst.get('InstanceId'))
         self.nodes = [node for node in kube_nodes
@@ -342,6 +483,8 @@ class AutoScalingErrorMessages(object):
     INSTANCE_LIMIT = re.compile(r'You have requested more instances \((?P<requested>\d+)\) than your current instance limit of (?P<limit>\d+) allows for the specified instance type. Please visit http://aws.amazon.com/contact-us/ec2-request to request an adjustment to this limit. Launching EC2 instance failed.')
     VOLUME_LIMIT = re.compile(r'Instance became unhealthy while waiting for instance to be in InService state. Termination Reason: Client.VolumeLimitExceeded: Volume limit exceeded')
     CAPACITY_LIMIT = re.compile(r'Insufficient capacity\. Launching EC2 instance failed\.')
+    SPOT_REQUEST_WAITING = re.compile(r'Placed Spot instance request: (?P<request_id>.+). Waiting for instance\(s\)')
+    SPOT_REQUEST_CANCELLED = re.compile(r'Spot instance request: (?P<request_id>.+) has been cancelled.')
 
 
 class AutoScalingCauseMessages(object):
