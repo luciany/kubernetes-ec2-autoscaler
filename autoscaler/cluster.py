@@ -87,6 +87,7 @@ class Cluster(object):
         self.autoscaling_groups = autoscaling_groups.AutoScalingGroups(
             session=self.session, regions=regions,
             cluster_name=cluster_name)
+        self.autoscaling_timeouts = autoscaling_groups.AutoScalingTimeouts(self.session)
 
         # config
         self.regions = regions
@@ -196,7 +197,7 @@ class Cluster(object):
             units_needed = len(new_instance_resources)
             units_needed += self.over_provision
 
-            if self.autoscaling_groups.is_timed_out(group):
+            if self.autoscaling_timeouts.is_timed_out(group):
                 # if a machine is timed out, it cannot be scaled further
                 # just account for its current capacity (it may have more
                 # being launched, but we're being conservative)
@@ -432,9 +433,7 @@ class Cluster(object):
         """
         scale up logic
         """
-        self.autoscaling_groups.time_out_spot_asgs(asgs)
-        for asg in asgs:
-            self.autoscaling_groups.reconcile_limits(asg, dry_run=self.dry_run)
+        self.autoscaling_timeouts.refresh_timeouts(asgs, dry_run=self.dry_run)
 
         cached_live_nodes = []
         for node in all_nodes:

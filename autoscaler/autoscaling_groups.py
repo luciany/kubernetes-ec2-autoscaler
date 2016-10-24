@@ -17,10 +17,6 @@ logger = logging.getLogger(__name__)
 
 class AutoScalingGroups(object):
     _BOTO_CLIENT_TYPE = 'autoscaling'
-    _TIMEOUT = 3600  # 1 hour
-    _SPOT_REQUEST_TIMEOUT = 300  # 5 minutes
-    _MAX_OUTBIDS_IN_INTERVAL = 0.2
-    _SPOT_HISTORY_PERIOD = 60*60*5  # 5 hours
 
     _CLUSTER_KEY = 'KubernetesCluster'
     _ROLE_KEYS = ('KubernetesRole', 'Role')
@@ -34,15 +30,6 @@ class AutoScalingGroups(object):
         self.session = session
         self.regions = regions
         self.cluster_name = cluster_name
-
-        # ASGs to avoid because of recent launch failures
-        # e.g. a region running out of capacity
-        # try to favor other regions
-        self._timeouts = {}
-        self._last_activities = {}
-
-        # ASGs to avoid because of spot pricing history
-        self._spot_timeouts = {}
 
     def get_all_launch_configs(self, client, raw_groups):
         all_launch_configs = {}
@@ -86,6 +73,35 @@ class AutoScalingGroups(object):
                     launch_configs[raw_group['LaunchConfigurationName']]))
 
         return groups
+
+
+class AutoScalingTimeouts(object):
+    _TIMEOUT = 3600  # 1 hour
+    _SPOT_REQUEST_TIMEOUT = 300  # 5 minutes
+    _MAX_OUTBIDS_IN_INTERVAL = 60*20  # 20 minutes
+    _SPOT_HISTORY_PERIOD = 60*60*5  # 5 hours
+
+    def __init__(self, session):
+        """
+        """
+        self.session = session
+
+        # ASGs to avoid because of recent launch failures
+        # e.g. a region running out of capacity
+        # try to favor other regions
+        self._timeouts = {}
+        self._last_activities = {}
+
+        # ASGs to avoid because of spot pricing history
+        self._spot_timeouts = {}
+
+    def refresh_timeouts(self, asgs, dry_run=False):
+        """
+        refresh timeouts on ASGs using new data from aws
+        """
+        self.time_out_spot_asgs(asgs)
+        for asg in asgs:
+            self.reconcile_limits(asg, dry_run=dry_run)
 
     def reconcile_limits(self, asg, dry_run=False):
         """
@@ -220,26 +236,11 @@ class AutoScalingGroups(object):
 
         return False
 
-    def get_spot_pricing_history(self, client, instance_types, since, next_token=None):
-        if next_token == '':
-            return []
-
-        kwargs = {
-            'StartTime': since,
-            'InstanceTypes': instance_types,
-            'ProductDescriptions': ['Linux/UNIX']
-        }
-        if next_token is not None:
-            kwargs['NextToken'] = next_token
-
-        history_data = client.describe_spot_price_history(**kwargs)
-        next_items = self.get_spot_pricing_history(
-            client, instance_types, since,
-            next_token=history_data.get('NextToken', ''))
-
-        return history_data['SpotPriceHistory'] + next_items
-
     def time_out_spot_asgs(self, asgs):
+        """
+        Using recent spot pricing data from AWS, time out spot instance
+        ASGs that would be outbid for more than _MAX_OUTBIDS_IN_INTERVAL seconds
+        """
         region_instance_asg_map = {}
         for asg in asgs:
             if not asg.is_spot:
@@ -249,7 +250,8 @@ class AutoScalingGroups(object):
             instance_type = asg.launch_config['InstanceType']
             instance_asg_map.setdefault(instance_type, []).append(asg)
 
-        since = datetime.datetime.utcnow() - datetime.timedelta(seconds=self._SPOT_HISTORY_PERIOD)
+        now = datetime.datetime.utcnow()
+        since = now - datetime.timedelta(seconds=self._SPOT_HISTORY_PERIOD)
 
         for region, instance_asg_map in region_instance_asg_map.items():
             client = self.session.client('ec2', region_name=region)
@@ -284,8 +286,8 @@ class AutoScalingGroups(object):
                         avg_outbid_time = sum(t.total_seconds() for t in outbid_time.values()) / len(outbid_time)
                     else:
                         avg_outbid_time = 0.0
-                    if (avg_outbid_time / self._SPOT_HISTORY_PERIOD) > self._MAX_OUTBIDS_IN_INTERVAL:
-                        self._spot_timeouts[asg._id] = since + datetime.timedelta(seconds=self._TIMEOUT)
+                    if avg_outbid_time > self._MAX_OUTBIDS_IN_INTERVAL:
+                        self._spot_timeouts[asg._id] = now + datetime.timedelta(seconds=self._TIMEOUT)
                         logger.info('%s (%s) is spot timed out until %s (would have been outbid for %ss on average)',
                                     asg.name, asg.region, self._spot_timeouts[asg._id], avg_outbid_time)
                     else:
